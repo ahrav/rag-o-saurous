@@ -23,3 +23,4 @@ testdata/
 *.db
 *.sqlite3
 *.sqlite
+*.db-*

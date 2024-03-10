@@ -56,7 +56,7 @@ func answerQuestion(client *openai.Client, question, dbPath string) {
 		SELECT chunks.path, chunks.content, embeddings.embedding
 		FROM chunks
 		INNER JOIN embeddings
-		ON chunks.id = embeddings.id
+		ON chunks.id = embeddings.chunk_id
 	`)
 	checkErr(err)
 	defer stmt.Close()
@@ -105,9 +105,9 @@ func answerQuestion(client *openai.Client, question, dbPath string) {
 		return int(100.0 * (a.Score - b.Score))
 	})
 
-	// Take the 3 best-scoring chunks as context and paste them together into contextInfo.
+	// Take the 5 best-scoring chunks as context and paste them together into contextInfo.
 	var contextInfo string
-	for i := len(scores) - 1; i > len(scores)-4; i-- {
+	for i := len(scores) - 1; i > len(scores)-6; i-- {
 		contextInfo = contextInfo + "\n" + scores[i].Content
 	}
 
@@ -160,6 +160,9 @@ func calculateEmbeddings(client *openai.Client, dbPath string, clear bool) {
     	embedding BLOB,
     	FOREIGN KEY (chunk_id) REFERENCES chunks(id)
 		);`)
+	checkErr(err)
+
+	_, err = db.Exec("PRAGMA journal_mode=WAL;")
 	checkErr(err)
 
 	if clear {
