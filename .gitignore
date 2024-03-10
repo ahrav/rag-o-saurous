@@ -1,0 +1,25 @@
+# Binaries and compiled files
+*.exe
+*.out
+*.a
+*.o
+*.so
+
+# Go module files
+bin/
+vendor/
+
+# IDE/Editor files
+.idea/
+*.swp
+*.swo
+
+# Local test data, logs, etc.
+log/
+data/
+testdata/
+
+# SQLite databases
+*.db
+*.sqlite3
+*.sqlite
