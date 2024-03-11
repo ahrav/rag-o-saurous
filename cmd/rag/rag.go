@@ -11,19 +11,20 @@ import (
 	"log"
 	"os"
 	"runtime"
-	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/chewxy/math32"
 	_ "github.com/mattn/go-sqlite3"
+	mvclient "github.com/milvus-io/milvus-sdk-go/v2/client"
+	"github.com/milvus-io/milvus-sdk-go/v2/entity"
 	"github.com/sashabaranov/go-openai"
 )
 
 func main() {
 	dbPath := flag.String("db", "chunks.db", "path to DB with chunks")
 	doCalculate := flag.Bool("calculate", false, "calculate embeddings and update DB")
-	clearEmbeddings := flag.Bool("clear", false, "clear embeddings in DB")
 	question := flag.String("question", "", "question to answer")
 	doAnswer := flag.Bool("answer", false, "answer question (DB must have embeddings already)")
 	flag.Parse()
@@ -32,83 +33,75 @@ func main() {
 		log.Fatal("must specify question to answer")
 	}
 
+	ctx := context.Background()
 	client := openai.NewClient(os.Getenv("OPENAI_TOKEN"))
 
+	mvClient, err := mvclient.NewClient(ctx, mvclient.Config{
+		Address: "https://in03-26de6b5e6ea1fee.api.gcp-us-west1.zillizcloud.com",
+		APIKey:  os.Getenv("MILVUS_API_KEY"),
+	})
+	checkErr(err)
+	defer mvClient.Close()
+
 	if *doAnswer {
-		answerQuestion(client, *question, *dbPath)
+		if err = mvClient.LoadCollection(ctx, collectionName, false); err != nil {
+			log.Fatal("fail to load collection:", err.Error())
+		}
+
+		fmt.Println("Collection loaded")
+		answerQuestion(client, mvClient, *question, *dbPath)
 	} else if *doCalculate {
-		calculateEmbeddings(client, *dbPath, *clearEmbeddings)
+		calculateEmbeddings(client, mvClient, *dbPath)
 	}
 }
+
+const collectionName = "test_collection"
 
 // answerQuestion queries the database for chunk content and embeddings,
 // scores each chunk against the question embedding with cosine similarity,
 // takes the top scoring chunks as context, builds a prompt with the context
 // and question, calls the OpenAI API to generate an answer, and prints the response.
-func answerQuestion(client *openai.Client, question, dbPath string) {
-	// Connect to the SQLite database
-	db, err := sql.Open("sqlite3", dbPath)
-	checkErr(err)
-	defer db.Close()
-
-	// SQL query to extract chunks' content along with embeddings.
-	stmt, err := db.Prepare(`
-		SELECT chunks.path, chunks.content, embeddings.embedding
-		FROM chunks
-		INNER JOIN embeddings
-		ON chunks.id = embeddings.chunk_id
-	`)
-	checkErr(err)
-	defer stmt.Close()
-
-	rows, err := stmt.Query()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer rows.Close()
-
-	type scoreRecord struct {
-		Path    string
-		Score   float32
-		Content string
-	}
-	var scores []scoreRecord
-
-	// Iterate through the rows, scoring each chunk with cosine similarity to the question's embedding.
+func answerQuestion(client *openai.Client, mvClient mvclient.Client, question, dbPath string) {
 	qEmb := getEmbedding(client, question)
-	for rows.Next() {
-		var (
-			path      string
-			content   string
-			embedding []byte
-		)
+	// Create a float vector from the question embedding.
+	vector := entity.FloatVector(qEmb)
 
-		err = rows.Scan(&path, &content, &embedding)
-		if err != nil {
-			log.Fatal(err)
+	// TODO: Look into this some more.
+	// Use flat search param.
+	sp, _ := entity.NewIndexFlatSearchParam()
+
+	ctx := context.Background()
+	sr, err := mvClient.Search(ctx, collectionName, nil, "", []string{"ChunkID"}, []entity.Vector{vector}, "Vector",
+		entity.L2, 5, sp)
+	checkErr(err)
+
+	var contextInfo string
+	for _, result := range sr {
+		var idColumn *entity.ColumnInt64
+		for _, field := range result.Fields {
+			if field.Name() == "ChunkID" {
+				c, ok := field.(*entity.ColumnInt64)
+				if ok {
+					idColumn = c
+				}
+			}
 		}
 
-		fmt.Printf("path: %s, content: %d, embedding: %d\n", path, len(content), len(embedding))
+		if idColumn == nil {
+			log.Fatal("result field not match")
+		}
 
-		contentEmb := decodeEmbedding(embedding)
-		score := cosineSimilarity(qEmb, contentEmb)
-		scores = append(scores, scoreRecord{path, score, content})
-		fmt.Println(path, score)
-	}
-	if err = rows.Err(); err != nil {
-		log.Fatal(err)
-	}
+		for i := 0; i < result.ResultCount; i++ {
+			id, err := idColumn.ValueByIdx(i)
+			checkErr(err)
 
-	fmt.Println(len(scores))
-	slices.SortFunc(scores, func(a, b scoreRecord) int {
-		// The scores are in the range [0, 1], so scale them to get non-zero integers for comparison.
-		return int(100.0 * (a.Score - b.Score))
-	})
+			// Retrieve the chunk content by chunk id.
+			content, err := getContentByChunkID(id)
+			checkErr(err)
 
-	// Take the 5 best-scoring chunks as context and paste them together into contextInfo.
-	var contextInfo string
-	for i := len(scores) - 1; i > len(scores)-6; i-- {
-		contextInfo = contextInfo + "\n" + scores[i].Content
+			fmt.Printf("chunk id: %d scores: %f\n", id, result.Scores[i])
+			contextInfo += fmt.Sprintf("Chunk ID: %d\nContent: %s\n\n", id, content)
+		}
 	}
 
 	// Build the prompt and execute the LLM API.
@@ -131,7 +124,9 @@ Question: %v`, contextInfo, question)
 			},
 		},
 	)
-	checkErr(err)
+	if err != nil {
+		log.Fatal("fail to create chat completion:", err.Error())
+	}
 
 	fmt.Println("Got response, ID:", resp.ID)
 	b, err := json.MarshalIndent(resp, "", "  ")
@@ -144,36 +139,44 @@ Question: %v`, contextInfo, question)
 	fmt.Println(choice.Message.Content)
 }
 
+func getContentByChunkID(id int64) (string, error) {
+	// Connect to the SQLite database
+	db, err := sql.Open("sqlite3", "chunks.db")
+	checkErr(err)
+	defer db.Close()
+
+	// SQL query to extract chunks' content along with embeddings.
+	stmt, err := db.Prepare(`
+		SELECT content
+		FROM chunks
+		WHERE id =?
+	`)
+	checkErr(err)
+	defer stmt.Close()
+
+	var content string
+	err = stmt.QueryRow(id).Scan(&content)
+	if err != nil {
+		return "", err
+	}
+
+	return content, nil
+}
+
 // calculateEmbeddings concurrently generates embeddings for all chunks in the
 // database that don't already have embeddings, using multiple goroutines.
 // It uses a buffered channel to distribute work and collect results.
-func calculateEmbeddings(client *openai.Client, dbPath string, clear bool) {
+func calculateEmbeddings(client *openai.Client, mvClient mvclient.Client, dbPath string) {
 	db, err := sql.Open("sqlite3", dbPath)
 	checkErr(err)
 	defer db.Close()
 
-	log.Println("Creating embeddings table if needed")
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS embeddings (
-  		id INTEGER PRIMARY KEY AUTOINCREMENT,
-    	chunk_id INTEGER,
-    	embedding BLOB,
-    	FOREIGN KEY (chunk_id) REFERENCES chunks(id)
-		);`)
-	checkErr(err)
-
 	_, err = db.Exec("PRAGMA journal_mode=WAL;")
 	checkErr(err)
 
-	if clear {
-		log.Println("Clearing embeddings table")
-		_, err = db.Exec(`DELETE FROM embeddings`)
-		checkErr(err)
-	}
-
 	type embData struct {
 		chunkID int
-		data    []byte
+		data    []float32
 	}
 
 	// Prepare for concurrent embedding generation.
@@ -183,26 +186,67 @@ func calculateEmbeddings(client *openai.Client, dbPath string, clear bool) {
 	var wg sync.WaitGroup
 
 	go func() {
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+			defer cancel()
+			if err = mvClient.Flush(ctx, collectionName, false); err != nil {
+				log.Fatal("fail to flush:", err.Error())
+			}
+
+			fmt.Println("flush completed")
+
+			idx, err := entity.NewIndexIvfFlat(entity.L2, 2)
+			if err != nil {
+				log.Fatal("fail to create ivf flat index:", err.Error())
+			}
+			if err = mvClient.CreateIndex(ctx, collectionName, "Vector", idx, false); err != nil {
+				log.Fatal("fail to create index:", err.Error())
+			}
+
+			sidx := entity.NewScalarIndex()
+			if err = mvClient.CreateIndex(ctx, collectionName, "ChunkID", sidx, false); err != nil {
+				log.Fatal("fail to create index:", err.Error())
+			}
+
+			fmt.Println("index created")
+
+			close(done)
+		}()
+
+		ctx := context.Background()
+		has, err := mvClient.HasCollection(ctx, collectionName)
+		if err != nil {
+			errChan <- err
+			return
+		}
+
+		if !has {
+			schema := entity.NewSchema().WithName(collectionName).WithDescription("test collection").
+				WithField(entity.NewField().WithName("ChunkID").WithDataType(entity.FieldTypeInt64).WithIsPrimaryKey(true)).
+				WithField(entity.NewField().WithName("Vector").WithDataType(entity.FieldTypeFloatVector).WithDim(1536))
+
+			if err = mvClient.CreateCollection(ctx, schema, entity.DefaultShardNumber); err != nil {
+				errChan <- err
+				return
+			}
+
+			fmt.Println("Collection created")
+		}
+
 		// Step 2: insert all embedding data into the embeddings table.
 		for emb := range embChan {
-			res, err := db.Exec("INSERT INTO embeddings (chunk_id, embedding) VALUES (?, ?)", emb.chunkID, emb.data)
+			vectorColumn := entity.NewColumnFloatVector("Vector", 1536, [][]float32{emb.data})
+			_, err = mvClient.Insert(ctx, collectionName, "", entity.NewColumnInt64("ChunkID", []int64{int64(emb.chunkID)}), vectorColumn)
 			if err != nil {
 				errChan <- err
 				return
 			}
-			rowID, err := res.LastInsertId()
-			checkErr(err)
-			fmt.Println("Inserted into embeddings, id", rowID)
+
+			fmt.Println("Inserted into embeddings, chunkID", emb.chunkID)
 		}
-		close(done)
 	}()
 
-	rows, err := db.Query(`
-        SELECT c.id, c.path, c.nchunk, c.content
-        FROM chunks c
-        LEFT JOIN embeddings e ON c.id = e.chunk_id
-        WHERE e.id IS NULL
-  `)
+	rows, err := db.Query(`SELECT id, path, nchunk, content FROM chunks WHERE id > 6200;`)
 	checkErr(err)
 	defer rows.Close()
 
@@ -235,7 +279,6 @@ func calculateEmbeddings(client *openai.Client, dbPath string, clear bool) {
 				if len(content) > 0 {
 					embeddings := getEmbeddings(client, content)
 					for _, emb := range embeddings {
-						emb := encodeEmbedding(emb)
 						select {
 						case embChan <- embData{chunkID: id, data: emb}:
 						case err := <-errChan:
@@ -316,7 +359,7 @@ func splitIntoChunks(data string, maxChars int) []string {
 func getEmbedding(client *openai.Client, data string) []float32 {
 	queryReq := openai.EmbeddingRequest{
 		Input: []string{data},
-		Model: openai.LargeEmbedding3,
+		Model: openai.SmallEmbedding3,
 	}
 
 	queryResponse, err := client.CreateEmbeddings(context.Background(), queryReq)
