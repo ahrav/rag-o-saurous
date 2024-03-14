@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -27,6 +28,7 @@ func main() {
 	doCalculate := flag.Bool("calculate", false, "calculate embeddings and update DB")
 	question := flag.String("question", "", "question to answer")
 	doAnswer := flag.Bool("answer", false, "answer question (DB must have embeddings already)")
+	useLocal := flag.Bool("local", false, "use local model")
 	flag.Parse()
 
 	if *doAnswer && *question == "" {
@@ -51,7 +53,7 @@ func main() {
 		}
 
 		fmt.Println("Collection loaded")
-		if err := answerQuestion(ctx, client, mvClient, *question); err != nil {
+		if err := answerQuestion(ctx, client, mvClient, *question, *useLocal); err != nil {
 			log.Fatal("fail to answer question:", err.Error())
 		}
 	} else if *doCalculate {
@@ -67,7 +69,7 @@ const collectionName = "test_collection"
 // scores each chunk against the question embedding with cosine similarity,
 // takes the top scoring chunks as context, builds a prompt with the context
 // and question, calls the OpenAI API to generate an answer, and prints the response.
-func answerQuestion(ctx context.Context, client *openai.Client, mvClient mvclient.Client, question string) error {
+func answerQuestion(ctx context.Context, client *openai.Client, mvClient mvclient.Client, question string, useLocal bool) error {
 	qEmb, err := getEmbedding(client, question)
 	if err != nil {
 		return fmt.Errorf("fail to get question embedding: %w", err)
@@ -126,42 +128,48 @@ Information:
 Question: %v`, contextInfo, question)
 
 	fmt.Println("Query:\n", query)
-	llm, err := ollama.New(ollama.WithModel("llama2"))
-	if err != nil {
-		return fmt.Errorf("fail to create llama model: %w", err)
+
+	if useLocal {
+		llm, err := ollama.New(ollama.WithModel("llama2"))
+		if err != nil {
+			return fmt.Errorf("fail to create llama model: %w", err)
+		}
+
+		completion, err := llms.GenerateFromSinglePrompt(ctx, llm, query)
+		if err != nil {
+			return fmt.Errorf("fail to generate completion: %w", err)
+		}
+
+		fmt.Println(completion)
+
+		return nil
 	}
 
-	completion, err := llms.GenerateFromSinglePrompt(ctx, llm, query)
+	resp, err := client.CreateChatCompletion(
+		context.Background(),
+		openai.ChatCompletionRequest{
+			Model: openai.GPT4TurboPreview,
+			Messages: []openai.ChatCompletionMessage{
+				{
+					Role:    openai.ChatMessageRoleUser,
+					Content: query,
+				},
+			},
+		},
+	)
 	if err != nil {
-		return fmt.Errorf("fail to generate completion: %w", err)
+		log.Fatal("fail to create chat completion:", err.Error())
 	}
 
-	// resp, err := client.CreateChatCompletion(
-	// 	context.Background(),
-	// 	openai.ChatCompletionRequest{
-	// 		Model: openai.GPT4TurboPreview,
-	// 		Messages: []openai.ChatCompletionMessage{
-	// 			{
-	// 				Role:    openai.ChatMessageRoleUser,
-	// 				Content: query,
-	// 			},
-	// 		},
-	// 	},
-	// )
-	// if err != nil {
-	// 	log.Fatal("fail to create chat completion:", err.Error())
-	// }
+	fmt.Println("Got response, ID:", resp.ID)
+	b, err := json.MarshalIndent(resp.Choices[0], "", "  ")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(string(b))
 
-	// fmt.Println("Got response, ID:", resp.ID)
-	// b, err := json.MarshalIndent(resp.Choices[0], "", "  ")
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	// fmt.Println(string(b))
-
-	// choice := resp.Choices[0]
-	// fmt.Println(choice.Message.Content)
-	fmt.Println(completion)
+	choice := resp.Choices[0]
+	fmt.Println(choice.Message.Content)
 	return nil
 }
 
