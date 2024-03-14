@@ -5,7 +5,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/binary"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -15,11 +14,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/chewxy/math32"
 	_ "github.com/mattn/go-sqlite3"
 	mvclient "github.com/milvus-io/milvus-sdk-go/v2/client"
 	"github.com/milvus-io/milvus-sdk-go/v2/entity"
 	"github.com/sashabaranov/go-openai"
+	"github.com/tmc/langchaingo/llms"
+	"github.com/tmc/langchaingo/llms/ollama"
 )
 
 func main() {
@@ -40,7 +40,9 @@ func main() {
 		Address: "https://in03-26de6b5e6ea1fee.api.gcp-us-west1.zillizcloud.com",
 		APIKey:  os.Getenv("MILVUS_API_KEY"),
 	})
-	checkErr(err)
+	if err != nil {
+		log.Fatal("fail to create milvus client:", err.Error())
+	}
 	defer mvClient.Close()
 
 	if *doAnswer {
@@ -49,9 +51,13 @@ func main() {
 		}
 
 		fmt.Println("Collection loaded")
-		answerQuestion(client, mvClient, *question, *dbPath)
+		if err := answerQuestion(ctx, client, mvClient, *question); err != nil {
+			log.Fatal("fail to answer question:", err.Error())
+		}
 	} else if *doCalculate {
-		calculateEmbeddings(client, mvClient, *dbPath)
+		if err = calculateEmbeddings(client, mvClient, *dbPath); err != nil {
+			log.Fatal("fail to calculate embeddings:", err.Error())
+		}
 	}
 }
 
@@ -61,8 +67,11 @@ const collectionName = "test_collection"
 // scores each chunk against the question embedding with cosine similarity,
 // takes the top scoring chunks as context, builds a prompt with the context
 // and question, calls the OpenAI API to generate an answer, and prints the response.
-func answerQuestion(client *openai.Client, mvClient mvclient.Client, question, dbPath string) {
-	qEmb := getEmbedding(client, question)
+func answerQuestion(ctx context.Context, client *openai.Client, mvClient mvclient.Client, question string) error {
+	qEmb, err := getEmbedding(client, question)
+	if err != nil {
+		return fmt.Errorf("fail to get question embedding: %w", err)
+	}
 	// Create a float vector from the question embedding.
 	vector := entity.FloatVector(qEmb)
 
@@ -70,10 +79,11 @@ func answerQuestion(client *openai.Client, mvClient mvclient.Client, question, d
 	// Use flat search param.
 	sp, _ := entity.NewIndexFlatSearchParam()
 
-	ctx := context.Background()
 	sr, err := mvClient.Search(ctx, collectionName, nil, "", []string{"ChunkID"}, []entity.Vector{vector}, "Vector",
-		entity.L2, 5, sp)
-	checkErr(err)
+		entity.L2, 3, sp)
+	if err != nil {
+		return fmt.Errorf("fail to search db: %w", err)
+	}
 
 	var contextInfo string
 	for _, result := range sr {
@@ -88,16 +98,20 @@ func answerQuestion(client *openai.Client, mvClient mvclient.Client, question, d
 		}
 
 		if idColumn == nil {
-			log.Fatal("result field not match")
+			return fmt.Errorf("fail to find chunk id column")
 		}
 
 		for i := 0; i < result.ResultCount; i++ {
 			id, err := idColumn.ValueByIdx(i)
-			checkErr(err)
+			if err != nil {
+				return fmt.Errorf("fail to get value by idx: %w", err)
+			}
 
 			// Retrieve the chunk content by chunk id.
 			content, err := getContentByChunkID(id)
-			checkErr(err)
+			if err != nil {
+				return fmt.Errorf("fail to get content by chunk id: %w", err)
+			}
 
 			fmt.Printf("chunk id: %d scores: %f\n", id, result.Scores[i])
 			contextInfo += fmt.Sprintf("Chunk ID: %d\nContent: %s\n\n", id, content)
@@ -112,37 +126,51 @@ Information:
 Question: %v`, contextInfo, question)
 
 	fmt.Println("Query:\n", query)
-	resp, err := client.CreateChatCompletion(
-		context.Background(),
-		openai.ChatCompletionRequest{
-			Model: openai.GPT4TurboPreview,
-			Messages: []openai.ChatCompletionMessage{
-				{
-					Role:    openai.ChatMessageRoleUser,
-					Content: query,
-				},
-			},
-		},
-	)
+	llm, err := ollama.New(ollama.WithModel("llama2"))
 	if err != nil {
-		log.Fatal("fail to create chat completion:", err.Error())
+		return fmt.Errorf("fail to create llama model: %w", err)
 	}
 
-	fmt.Println("Got response, ID:", resp.ID)
-	b, err := json.MarshalIndent(resp, "", "  ")
+	completion, err := llms.GenerateFromSinglePrompt(ctx, llm, query)
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("fail to generate completion: %w", err)
 	}
-	fmt.Println(string(b))
 
-	choice := resp.Choices[0]
-	fmt.Println(choice.Message.Content)
+	// resp, err := client.CreateChatCompletion(
+	// 	context.Background(),
+	// 	openai.ChatCompletionRequest{
+	// 		Model: openai.GPT4TurboPreview,
+	// 		Messages: []openai.ChatCompletionMessage{
+	// 			{
+	// 				Role:    openai.ChatMessageRoleUser,
+	// 				Content: query,
+	// 			},
+	// 		},
+	// 	},
+	// )
+	// if err != nil {
+	// 	log.Fatal("fail to create chat completion:", err.Error())
+	// }
+
+	// fmt.Println("Got response, ID:", resp.ID)
+	// b, err := json.MarshalIndent(resp.Choices[0], "", "  ")
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// fmt.Println(string(b))
+
+	// choice := resp.Choices[0]
+	// fmt.Println(choice.Message.Content)
+	fmt.Println(completion)
+	return nil
 }
 
 func getContentByChunkID(id int64) (string, error) {
 	// Connect to the SQLite database
 	db, err := sql.Open("sqlite3", "chunks.db")
-	checkErr(err)
+	if err != nil {
+		return "", err
+	}
 	defer db.Close()
 
 	// SQL query to extract chunks' content along with embeddings.
@@ -151,7 +179,9 @@ func getContentByChunkID(id int64) (string, error) {
 		FROM chunks
 		WHERE id =?
 	`)
-	checkErr(err)
+	if err != nil {
+		return "", err
+	}
 	defer stmt.Close()
 
 	var content string
@@ -166,13 +196,16 @@ func getContentByChunkID(id int64) (string, error) {
 // calculateEmbeddings concurrently generates embeddings for all chunks in the
 // database that don't already have embeddings, using multiple goroutines.
 // It uses a buffered channel to distribute work and collect results.
-func calculateEmbeddings(client *openai.Client, mvClient mvclient.Client, dbPath string) {
+func calculateEmbeddings(client *openai.Client, mvClient mvclient.Client, dbPath string) error {
 	db, err := sql.Open("sqlite3", dbPath)
-	checkErr(err)
+	if err != nil {
+		return fmt.Errorf("fail to open db: %w", err)
+	}
 	defer db.Close()
 
-	_, err = db.Exec("PRAGMA journal_mode=WAL;")
-	checkErr(err)
+	if _, err = db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
+		return fmt.Errorf("fail to set journal mode: %w", err)
+	}
 
 	type embData struct {
 		chunkID int
@@ -197,15 +230,15 @@ func calculateEmbeddings(client *openai.Client, mvClient mvclient.Client, dbPath
 
 			idx, err := entity.NewIndexIvfFlat(entity.L2, 2)
 			if err != nil {
-				log.Fatal("fail to create ivf flat index:", err.Error())
+				errChan <- fmt.Errorf("fail to create ivf flat index: %w", err)
 			}
 			if err = mvClient.CreateIndex(ctx, collectionName, "Vector", idx, false); err != nil {
-				log.Fatal("fail to create index:", err.Error())
+				errChan <- fmt.Errorf("fail to create index: %w", err)
 			}
 
 			sidx := entity.NewScalarIndex()
 			if err = mvClient.CreateIndex(ctx, collectionName, "ChunkID", sidx, false); err != nil {
-				log.Fatal("fail to create index:", err.Error())
+				errChan <- fmt.Errorf("fail to create index: %w", err)
 			}
 
 			fmt.Println("index created")
@@ -216,7 +249,7 @@ func calculateEmbeddings(client *openai.Client, mvClient mvclient.Client, dbPath
 		ctx := context.Background()
 		has, err := mvClient.HasCollection(ctx, collectionName)
 		if err != nil {
-			errChan <- err
+			errChan <- fmt.Errorf("fail to check collection: %w", err)
 			return
 		}
 
@@ -247,7 +280,9 @@ func calculateEmbeddings(client *openai.Client, mvClient mvclient.Client, dbPath
 	}()
 
 	rows, err := db.Query(`SELECT id, path, nchunk, content FROM chunks WHERE id > 6200;`)
-	checkErr(err)
+	if err != nil {
+		return fmt.Errorf("fail to query db: %w", err)
+	}
 	defer rows.Close()
 
 	maxWorkers := runtime.NumCPU()
@@ -262,7 +297,7 @@ func calculateEmbeddings(client *openai.Client, mvClient mvclient.Client, dbPath
 		)
 		if err = rows.Scan(&id, &path, &nchunk, &content); err != nil {
 			close(embChan)
-			log.Fatal(err)
+			return fmt.Errorf("fail to scan row: %w", err)
 		}
 
 		wg.Add(1)
@@ -277,7 +312,12 @@ func calculateEmbeddings(client *openai.Client, mvClient mvclient.Client, dbPath
 			default:
 				fmt.Printf("id: %d, path: %s, nchunk: %d, content: %d\n", id, path, nchunk, len(content))
 				if len(content) > 0 {
-					embeddings := getEmbeddings(client, content)
+					embeddings, err := getEmbeddings(client, content)
+					if err != nil {
+						errChan <- fmt.Errorf("fail to get embeddings: %w", err)
+						return
+					}
+
 					for _, emb := range embeddings {
 						select {
 						case embChan <- embData{chunkID: id, data: emb}:
@@ -292,7 +332,7 @@ func calculateEmbeddings(client *openai.Client, mvClient mvclient.Client, dbPath
 	}
 
 	if err = rows.Err(); err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("fail to iterate rows: %w", err)
 	}
 
 	wg.Wait()
@@ -300,28 +340,38 @@ func calculateEmbeddings(client *openai.Client, mvClient mvclient.Client, dbPath
 
 	select {
 	case err := <-errChan:
-		log.Fatal("Operation failed:", err)
+		return err
 	default:
 		<-done // Wait for the insertion routine to finish
 	}
 
+	return nil
 }
 
 // getEmbedding invokes the OpenAI embedding API to calculate the embedding
 // for the given string. It returns the embedding.
-func getEmbeddings(client *openai.Client, data string) [][]float32 {
+func getEmbeddings(client *openai.Client, data string) ([][]float32, error) {
 	var embeddings [][]float32
 	const maxTokensPerRequest = 8192
 	if len(data) <= maxTokensPerRequest {
-		embeddings = append(embeddings, getEmbedding(client, data))
-		return embeddings
+		emb, err := getEmbedding(client, data)
+		if err != nil {
+			return nil, fmt.Errorf("fail to get embedding: %w", err)
+		}
+
+		embeddings = append(embeddings, emb)
+		return embeddings, nil
 	}
 
 	chunks := splitIntoChunks(data, maxTokensPerRequest)
 	for _, chunk := range chunks {
-		embeddings = append(embeddings, getEmbedding(client, chunk))
+		emb, err := getEmbedding(client, chunk)
+		if err != nil {
+			return nil, fmt.Errorf("fail to get embedding: %w", err)
+		}
+		embeddings = append(embeddings, emb)
 	}
-	return embeddings
+	return embeddings, nil
 }
 
 func splitIntoChunks(data string, maxChars int) []string {
@@ -356,54 +406,36 @@ func splitIntoChunks(data string, maxChars int) []string {
 	return chunks
 }
 
-func getEmbedding(client *openai.Client, data string) []float32 {
+func getEmbedding(client *openai.Client, data string) ([]float32, error) {
 	queryReq := openai.EmbeddingRequest{
 		Input: []string{data},
 		Model: openai.SmallEmbedding3,
 	}
 
 	queryResponse, err := client.CreateEmbeddings(context.Background(), queryReq)
-	checkErr(err)
-	return queryResponse.Data[0].Embedding
+	if err != nil {
+		return nil, fmt.Errorf("fail to create embeddings: %w", err)
+	}
+	return queryResponse.Data[0].Embedding, nil
 }
 
 // encodeEmbedding encodes an embedding into a byte buffer, e.g. for DB storage as a blob.
-func encodeEmbedding(emb []float32) []byte {
+func encodeEmbedding(emb []float32) ([]byte, error) {
 	buf := make([]byte, len(emb)*4)
-	err := binary.Write(bytes.NewBuffer(buf), binary.LittleEndian, emb)
-	checkErr(err)
-	return buf
+	if err := binary.Write(bytes.NewBuffer(buf), binary.LittleEndian, emb); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 // decodeEmbedding decodes an embedding back from a byte buffer.
-func decodeEmbedding(b []byte) []float32 {
+func decodeEmbedding(b []byte) ([]float32, error) {
 	// Calculate how many float32 values are in the slice.
 	count := len(b) / 4
 	numbers := make([]float32, count)
-	err := binary.Read(bytes.NewBuffer(b), binary.LittleEndian, numbers)
-	checkErr(err)
-
-	return numbers
-}
-
-// cosineSimilarity calculates cosine similarity (magnitude-adjusted dot product)
-// between two vectors that must be of the same size.
-func cosineSimilarity(a, b []float32) float32 {
-	if len(a) != len(b) {
-		panic("different lengths")
+	if err := binary.Read(bytes.NewBuffer(b), binary.LittleEndian, numbers); err != nil {
+		return nil, err
 	}
 
-	var aMag, bMag, dotProduct float32
-	for i := range a {
-		aMag += a[i] * a[i]
-		bMag += b[i] * b[i]
-		dotProduct += a[i] * b[i]
-	}
-	return dotProduct / (math32.Sqrt(aMag) * math32.Sqrt(bMag))
-}
-
-func checkErr(err error) {
-	if err != nil {
-		panic(err)
-	}
+	return numbers, nil
 }
