@@ -21,18 +21,23 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/pkoukk/tiktoken-go"
+	"golang.org/x/net/html"
 )
 
 const tokenEncoding = "cl100k_base"
 const tableName = "chunks"
-const chunkSize = 4000
+const chunkSize = 4096
 
 const tableSql = `CREATE TABLE IF NOT EXISTS %v (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   path TEXT,
   nchunk INTEGER,
-  content TEXT
-);`
+  content TEXT,
+  processed INTEGER DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_processed ON %v (processed);
+`
 
 func main() {
 
@@ -56,7 +61,7 @@ func main() {
 	db, err := sql.Open("sqlite3", *outDb)
 	checkErr(err)
 
-	_, err = db.Exec(fmt.Sprintf(tableSql, tableName))
+	_, err = db.Exec(fmt.Sprintf(tableSql, tableName, tableName))
 	checkErr(err)
 
 	if *doClear {
@@ -65,7 +70,7 @@ func main() {
 		checkErr(err)
 	}
 
-	insertStmt, err := db.Prepare("insert into chunks(path, nchunk, content) values(?, ?, ?)")
+	insertStmt, err := db.Prepare("insert into chunks(path, nchunk, content, processed) values(?, ?, ?, 0)")
 	checkErr(err)
 
 	// Initialize the token encoder.
@@ -78,7 +83,6 @@ func main() {
 
 	var tokTotal atomic.Uint64
 	err = filepath.WalkDir(*rootDir, func(path string, d fs.DirEntry, err error) error {
-
 		if val, exists := extensions[filepath.Ext(path)]; exists {
 			wg.Add(1)
 			semaphore <- struct{}{}
@@ -94,6 +98,8 @@ func main() {
 				var chunks []string
 				if val == "go" {
 					chunks = chunkGoFile(tokenEncoder, path)
+				} else if val == "html" {
+					chunks = chunkHtmlFile(tokenEncoder, path)
 				} else {
 					chunks = chunkTextFile(tokenEncoder, path)
 				}
@@ -219,4 +225,57 @@ func scanParagraphs(data []byte, atEOF bool) (advance int, token []byte, err err
 	}
 
 	return 0, nil, nil
+}
+
+func chunkHtmlFile(encoder *tiktoken.Tiktoken, path string) []string {
+	f, err := os.Open(path)
+	checkErr(err)
+	defer f.Close()
+
+	doc, err := html.Parse(f)
+	checkErr(err)
+
+	var chunks []string
+	var currentChunk string
+
+	var extractText func(*html.Node)
+	extractText = func(n *html.Node) {
+		if n.Type == html.ElementNode && (n.Data == "script" || n.Data == "style") {
+			return // Skip script and style elements
+		}
+		if n.Type == html.TextNode {
+			text := strings.TrimSpace(n.Data)
+			if text != "" {
+				currentChunk += text + " "
+
+				toks := encoder.Encode(currentChunk, nil, nil)
+				if len(toks) > chunkSize {
+					chunks = append(chunks, strings.TrimSpace(currentChunk))
+					currentChunk = ""
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			extractText(c)
+		}
+	}
+
+	var skipElement func(*html.Node)
+	skipElement = func(n *html.Node) {
+		if n.Type == html.ElementNode && (n.Data == "script" || n.Data == "style") {
+			return
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			skipElement(c)
+		}
+	}
+
+	skipElement(doc)
+	extractText(doc)
+
+	if currentChunk != "" {
+		chunks = append(chunks, strings.TrimSpace(currentChunk))
+	}
+
+	return chunks
 }

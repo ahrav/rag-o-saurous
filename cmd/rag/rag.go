@@ -47,19 +47,20 @@ func main() {
 	}
 	defer mvClient.Close()
 
-	if *doAnswer {
+	switch {
+	case *doAnswer:
 		if err = mvClient.LoadCollection(ctx, collectionName, false); err != nil {
 			log.Fatal("fail to load collection:", err.Error())
 		}
-
-		fmt.Println("Collection loaded")
-		if err := answerQuestion(ctx, client, mvClient, *question, *useLocal); err != nil {
+		if err = answerQuestion(ctx, client, mvClient, *question, *useLocal); err != nil {
 			log.Fatal("fail to answer question:", err.Error())
 		}
-	} else if *doCalculate {
-		if err = calculateEmbeddings(client, mvClient, *dbPath); err != nil {
+	case *doCalculate:
+		if err = calculateEmbeddings(ctx, client, mvClient, *dbPath); err != nil {
 			log.Fatal("fail to calculate embeddings:", err.Error())
 		}
+	default:
+		log.Fatal("must specify -calculate or -answer")
 	}
 }
 
@@ -204,7 +205,7 @@ func getContentByChunkID(id int64) (string, error) {
 // calculateEmbeddings concurrently generates embeddings for all chunks in the
 // database that don't already have embeddings, using multiple goroutines.
 // It uses a buffered channel to distribute work and collect results.
-func calculateEmbeddings(client *openai.Client, mvClient mvclient.Client, dbPath string) error {
+func calculateEmbeddings(ctx context.Context, client *openai.Client, mvClient mvclient.Client, dbPath string) error {
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return fmt.Errorf("fail to open db: %w", err)
@@ -228,7 +229,7 @@ func calculateEmbeddings(client *openai.Client, mvClient mvclient.Client, dbPath
 
 	go func() {
 		defer func() {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+			ctx, cancel := context.WithTimeout(ctx, time.Second*30)
 			defer cancel()
 			if err = mvClient.Flush(ctx, collectionName, false); err != nil {
 				log.Fatal("fail to flush:", err.Error())
@@ -274,20 +275,59 @@ func calculateEmbeddings(client *openai.Client, mvClient mvclient.Client, dbPath
 			fmt.Println("Collection created")
 		}
 
-		// Step 2: insert all embedding data into the embeddings table.
-		for emb := range embChan {
-			vectorColumn := entity.NewColumnFloatVector("Vector", 1536, [][]float32{emb.data})
-			_, err = mvClient.Insert(ctx, collectionName, "", entity.NewColumnInt64("ChunkID", []int64{int64(emb.chunkID)}), vectorColumn)
+		// Step 2: insert all embedding data into the embeddings table in batches.
+		const batchSize = 500
+		chunkIDs := make([]int64, 0, batchSize)
+		vectors := make([][]float32, 0, batchSize)
+
+		updateChunksTable := func(chunkIDs []int64) {
+			updateQuery := "UPDATE chunks SET processed = 1 WHERE id IN (" + placeholders(len(chunkIDs)) + ")"
+			updateArgs := make([]any, len(chunkIDs))
+			for i, chunkID := range chunkIDs {
+				updateArgs[i] = chunkID
+			}
+			_, err := db.Exec(updateQuery, updateArgs...)
 			if err != nil {
 				errChan <- err
 				return
 			}
 
-			fmt.Println("Inserted into embeddings, chunkID", emb.chunkID)
+			fmt.Printf("Updated chunks table, batch size: %d\n", len(chunkIDs))
+		}
+
+		insertEmbeddings := func() {
+			chunkIDColumn := entity.NewColumnInt64("ChunkID", chunkIDs)
+			vectorColumn := entity.NewColumnFloatVector("Vector", 1536, vectors)
+			_, err = mvClient.Insert(ctx, collectionName, "", chunkIDColumn, vectorColumn)
+			if err != nil {
+				errChan <- err
+				return
+			}
+
+			fmt.Printf("Inserted into embeddings, batch size: %d\n", len(chunkIDs))
+
+			updateChunksTable(chunkIDs)
+
+			// Reset the slices for the next batch.
+			chunkIDs = chunkIDs[:0]
+			vectors = vectors[:0]
+		}
+
+		for emb := range embChan {
+			chunkIDs = append(chunkIDs, int64(emb.chunkID))
+			vectors = append(vectors, emb.data)
+
+			if len(chunkIDs) >= batchSize {
+				insertEmbeddings()
+			}
+		}
+
+		if len(chunkIDs) > 0 {
+			insertEmbeddings()
 		}
 	}()
 
-	rows, err := db.Query(`SELECT id, path, nchunk, content FROM chunks WHERE id > 6200;`)
+	rows, err := db.Query(`SELECT id, content FROM chunks WHERE processed IS FALSE;`)
 	if err != nil {
 		return fmt.Errorf("fail to query db: %w", err)
 	}
@@ -299,18 +339,16 @@ func calculateEmbeddings(client *openai.Client, mvClient mvclient.Client, dbPath
 	for rows.Next() {
 		var (
 			id      int
-			path    string
-			nchunk  int
 			content string
 		)
-		if err = rows.Scan(&id, &path, &nchunk, &content); err != nil {
+		if err = rows.Scan(&id, &content); err != nil {
 			close(embChan)
 			return fmt.Errorf("fail to scan row: %w", err)
 		}
 
 		wg.Add(1)
 		semaphore <- struct{}{}
-		go func(id int, content, path string, nchunk int) {
+		go func(id int, content string) {
 			defer wg.Done()
 			defer func() { <-semaphore }()
 			// Check for previous errors to avoid unnecessary work.
@@ -318,7 +356,7 @@ func calculateEmbeddings(client *openai.Client, mvClient mvclient.Client, dbPath
 			case <-errChan:
 				return
 			default:
-				fmt.Printf("id: %d, path: %s, nchunk: %d, content: %d\n", id, path, nchunk, len(content))
+				fmt.Printf("id: %d, content size: %d\n", id, len(content))
 				if len(content) > 0 {
 					embeddings, err := getEmbeddings(client, content)
 					if err != nil {
@@ -336,7 +374,7 @@ func calculateEmbeddings(client *openai.Client, mvClient mvclient.Client, dbPath
 					}
 				}
 			}
-		}(id, content, path, nchunk)
+		}(id, content)
 	}
 
 	if err = rows.Err(); err != nil {
@@ -354,6 +392,11 @@ func calculateEmbeddings(client *openai.Client, mvClient mvclient.Client, dbPath
 	}
 
 	return nil
+}
+
+// Helper function to generate placeholders for the UPDATE query
+func placeholders(n int) string {
+	return strings.Repeat("?,", n-1) + "?"
 }
 
 // getEmbedding invokes the OpenAI embedding API to calculate the embedding
