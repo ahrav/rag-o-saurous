@@ -26,17 +26,32 @@ import (
 
 const tokenEncoding = "cl100k_base"
 const tableName = "chunks"
+const fileTypeTableName = "file_types"
 const chunkSize = 4096
 
-const tableSql = `CREATE TABLE IF NOT EXISTS %v (
+const tableSql = `
+CREATE TABLE IF NOT EXISTS %v (
+  id INTEGER PRIMARY KEY,
+  file_type TEXT UNIQUE
+);
+
+INSERT OR IGNORE INTO %v (id, file_type) VALUES
+  (1, '.go'),
+  (2, '.html'),
+  (3, '.md');
+
+CREATE TABLE IF NOT EXISTS %v (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   path TEXT,
   nchunk INTEGER,
   content TEXT,
-  processed INTEGER DEFAULT 0
+  processed INTEGER DEFAULT 0,
+  file_type_id INTEGER,
+  FOREIGN KEY (file_type_id) REFERENCES %v (id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_processed ON %v (processed);
+CREATE INDEX IF NOT EXISTS idx_file_type_id ON %v (file_type_id);
 `
 
 func main() {
@@ -61,7 +76,8 @@ func main() {
 	db, err := sql.Open("sqlite3", *outDb)
 	checkErr(err)
 
-	_, err = db.Exec(fmt.Sprintf(tableSql, tableName, tableName))
+	stmt := fmt.Sprintf(tableSql, fileTypeTableName, fileTypeTableName, tableName, fileTypeTableName, tableName, tableName)
+	_, err = db.Exec(stmt)
 	checkErr(err)
 
 	if *doClear {
@@ -70,7 +86,7 @@ func main() {
 		checkErr(err)
 	}
 
-	insertStmt, err := db.Prepare("insert into chunks(path, nchunk, content, processed) values(?, ?, ?, 0)")
+	insertStmt, err := db.Prepare("insert into chunks(path, nchunk, content, processed, file_type_id) values(?, ?, ?, 0, ?)")
 	checkErr(err)
 
 	// Initialize the token encoder.
@@ -80,6 +96,10 @@ func main() {
 	var wg sync.WaitGroup
 	numCPU := runtime.NumCPU()
 	semaphore := make(chan struct{}, numCPU)
+
+	const batchSize = 100
+	var batchesMutex sync.Mutex
+	var batches [][]any
 
 	var tokTotal atomic.Uint64
 	err = filepath.WalkDir(*rootDir, func(path string, d fs.DirEntry, err error) error {
@@ -96,23 +116,51 @@ func main() {
 				log.Printf("Chunking %v", path)
 
 				var chunks []string
+				var fileTypeID int
 				if val == "go" {
 					chunks = chunkGoFile(tokenEncoder, path)
+					fileTypeID = 1
 				} else if val == "html" {
 					chunks = chunkHtmlFile(tokenEncoder, path)
+					fileTypeID = 2
 				} else {
 					chunks = chunkTextFile(tokenEncoder, path)
+					fileTypeID = 3
 				}
 
+				var batch []interface{}
 				for i, chunk := range chunks {
 					fmt.Println(path, i, len(chunk))
 					tokTotal.Add(uint64(len(chunk)))
 					if *dryRun {
 						continue
 					}
-					_, err := insertStmt.Exec(path, i, chunk)
-					checkErr(err)
+					batch = append(batch, path, i, chunk, fileTypeID)
+
+					if len(batch)/4 >= batchSize {
+						batchesMutex.Lock()
+						batches = append(batches, batch)
+						if len(batches) >= batchSize {
+							for _, batch := range batches {
+								for i := 0; i < len(batch); i += 4 {
+									_, err := insertStmt.Exec(batch[i], batch[i+1], batch[i+2], batch[i+3])
+									checkErr(err)
+								}
+							}
+							batches = nil
+						}
+						batchesMutex.Unlock()
+						batch = nil
+					}
+
 				}
+
+				if len(batch) > 0 {
+					batchesMutex.Lock()
+					batches = append(batches, batch)
+					batchesMutex.Unlock()
+				}
+
 			}(path, val)
 		}
 
@@ -120,6 +168,17 @@ func main() {
 	})
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	wg.Wait()
+
+	if len(batches) > 0 {
+		for _, batch := range batches {
+			for i := 0; i < len(batch); i += 4 {
+				_, err := insertStmt.Exec(batch[i], batch[i+1], batch[i+2], batch[i+3])
+				checkErr(err)
+			}
+		}
 	}
 
 	fmt.Println("Total tokens:", tokTotal.Load())

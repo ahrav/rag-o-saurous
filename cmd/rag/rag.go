@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
-	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -23,6 +21,9 @@ import (
 	"github.com/tmc/langchaingo/llms/ollama"
 )
 
+// main function is the entry point of the program.
+// It parses command line flags and initializes the necessary clients.
+// Depending on the flags, it either calculates embeddings and updates the DB or answers a question.
 func main() {
 	dbPath := flag.String("db", "chunks.db", "path to DB with chunks")
 	doCalculate := flag.Bool("calculate", false, "calculate embeddings and update DB")
@@ -66,10 +67,8 @@ func main() {
 
 const collectionName = "test_collection"
 
-// answerQuestion queries the database for chunk content and embeddings,
-// scores each chunk against the question embedding with cosine similarity,
-// takes the top scoring chunks as context, builds a prompt with the context
-// and question, calls the OpenAI API to generate an answer, and prints the response.
+// answerQuestion function gets the embedding for the question, searches for similar embeddings in the DB,
+// retrieves the corresponding chunks, and generates an answer using either a local model or the OpenAI API.
 func answerQuestion(ctx context.Context, client *openai.Client, mvClient mvclient.Client, question string, useLocal bool) error {
 	qEmb, err := getEmbedding(client, question)
 	if err != nil {
@@ -78,18 +77,40 @@ func answerQuestion(ctx context.Context, client *openai.Client, mvClient mvclien
 	// Create a float vector from the question embedding.
 	vector := entity.FloatVector(qEmb)
 
-	// TODO: Look into this some more.
-	// Use flat search param.
-	sp, _ := entity.NewIndexFlatSearchParam()
-
-	sr, err := mvClient.Search(ctx, collectionName, nil, "", []string{"ChunkID"}, []entity.Vector{vector}, "Vector",
-		entity.L2, 3, sp)
+	// Create a search param for the HNSW index.
+	sp, err := entity.NewIndexHNSWSearchParam(64)
 	if err != nil {
-		return fmt.Errorf("fail to search db: %w", err)
+		return fmt.Errorf("fail to create search param: %w", err)
 	}
 
-	var contextInfo string
-	for _, result := range sr {
+	// Search for similar embeddings concurrently in the DB. We search using two queries:
+	// 1. Search for similar embeddings for Go files with a higher topK value.
+	// 2. Search for similar embeddings for non-Go files with a lower topK value.
+	var results []mvclient.SearchResult
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sr, err := mvClient.Search(ctx, collectionName, nil, `FileType == ".go"`, []string{"ChunkID"}, []entity.Vector{vector}, "Vector",
+			entity.COSINE, 2, sp)
+		if err != nil {
+			panic(err)
+		}
+		results = append(results, sr...)
+	}()
+
+	sr, err := mvClient.Search(ctx, collectionName, nil, `FileType != ".go"`, []string{"ChunkID"}, []entity.Vector{vector}, "Vector",
+		entity.COSINE, 1, sp)
+	if err != nil {
+		panic(err)
+	}
+	results = append(results, sr...)
+
+	wg.Wait()
+
+	// Retrieve the corresponding chunks for the similar embeddings.
+	var contextInfo strings.Builder
+	for _, result := range results {
 		var idColumn *entity.ColumnInt64
 		for _, field := range result.Fields {
 			if field.Name() == "ChunkID" {
@@ -117,7 +138,7 @@ func answerQuestion(ctx context.Context, client *openai.Client, mvClient mvclien
 			}
 
 			fmt.Printf("chunk id: %d scores: %f\n", id, result.Scores[i])
-			contextInfo += fmt.Sprintf("Chunk ID: %d\nContent: %s\n\n", id, content)
+			contextInfo.WriteString(content)
 		}
 	}
 
@@ -126,7 +147,7 @@ func answerQuestion(ctx context.Context, client *openai.Client, mvClient mvclien
 Information:
 %v
 
-Question: %v`, contextInfo, question)
+Question: %v`, contextInfo.String(), question)
 
 	fmt.Println("Query:\n", query)
 
@@ -217,8 +238,9 @@ func calculateEmbeddings(ctx context.Context, client *openai.Client, mvClient mv
 	}
 
 	type embData struct {
-		chunkID int
-		data    []float32
+		chunkID  int
+		fileType string
+		data     []float32
 	}
 
 	// Prepare for concurrent embedding generation.
@@ -227,6 +249,9 @@ func calculateEmbeddings(ctx context.Context, client *openai.Client, mvClient mv
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 
+	// Concurrently generate embeddings for all chunks in the DB, storing them in embs.
+	// Then, insert all embedding data into the embeddings table in batches.
+	// Finally, create indexes for the embeddings table.
 	go func() {
 		defer func() {
 			ctx, cancel := context.WithTimeout(ctx, time.Second*30)
@@ -237,9 +262,9 @@ func calculateEmbeddings(ctx context.Context, client *openai.Client, mvClient mv
 
 			fmt.Println("flush completed")
 
-			idx, err := entity.NewIndexIvfFlat(entity.L2, 2)
+			idx, err := entity.NewIndexHNSW(entity.COSINE, 16, 64)
 			if err != nil {
-				errChan <- fmt.Errorf("fail to create ivf flat index: %w", err)
+				errChan <- fmt.Errorf("fail to create HNSW index: %w", err)
 			}
 			if err = mvClient.CreateIndex(ctx, collectionName, "Vector", idx, false); err != nil {
 				errChan <- fmt.Errorf("fail to create index: %w", err)
@@ -247,7 +272,11 @@ func calculateEmbeddings(ctx context.Context, client *openai.Client, mvClient mv
 
 			sidx := entity.NewScalarIndex()
 			if err = mvClient.CreateIndex(ctx, collectionName, "ChunkID", sidx, false); err != nil {
-				errChan <- fmt.Errorf("fail to create index: %w", err)
+				errChan <- fmt.Errorf("fail to create index for ChunkID: %w", err)
+			}
+
+			if err = mvClient.CreateIndex(ctx, collectionName, "FileType", sidx, false); err != nil {
+				errChan <- fmt.Errorf("fail to create index for FileTyp: %w", err)
 			}
 
 			fmt.Println("index created")
@@ -265,9 +294,11 @@ func calculateEmbeddings(ctx context.Context, client *openai.Client, mvClient mv
 		if !has {
 			schema := entity.NewSchema().WithName(collectionName).WithDescription("test collection").
 				WithField(entity.NewField().WithName("ChunkID").WithDataType(entity.FieldTypeInt64).WithIsPrimaryKey(true)).
-				WithField(entity.NewField().WithName("Vector").WithDataType(entity.FieldTypeFloatVector).WithDim(1536))
+				WithField(entity.NewField().WithName("FileType").WithDataType(entity.FieldTypeVarChar).WithMaxLength(16)).
+				WithField(entity.NewField().WithName("Vector").WithDataType(entity.FieldTypeFloatVector).WithDim(3072))
 
 			if err = mvClient.CreateCollection(ctx, schema, entity.DefaultShardNumber); err != nil {
+				fmt.Printf("ERROR: %v\n", err)
 				errChan <- err
 				return
 			}
@@ -278,6 +309,7 @@ func calculateEmbeddings(ctx context.Context, client *openai.Client, mvClient mv
 		// Step 2: insert all embedding data into the embeddings table in batches.
 		const batchSize = 500
 		chunkIDs := make([]int64, 0, batchSize)
+		fileTypes := make([]string, 0, batchSize)
 		vectors := make([][]float32, 0, batchSize)
 
 		updateChunksTable := func(chunkIDs []int64) {
@@ -297,8 +329,9 @@ func calculateEmbeddings(ctx context.Context, client *openai.Client, mvClient mv
 
 		insertEmbeddings := func() {
 			chunkIDColumn := entity.NewColumnInt64("ChunkID", chunkIDs)
-			vectorColumn := entity.NewColumnFloatVector("Vector", 1536, vectors)
-			_, err = mvClient.Insert(ctx, collectionName, "", chunkIDColumn, vectorColumn)
+			vectorColumn := entity.NewColumnFloatVector("Vector", 3072, vectors)
+			fileTypeColumn := entity.NewColumnVarChar("FileType", fileTypes)
+			_, err = mvClient.Insert(ctx, collectionName, "", chunkIDColumn, fileTypeColumn, vectorColumn)
 			if err != nil {
 				errChan <- err
 				return
@@ -310,12 +343,14 @@ func calculateEmbeddings(ctx context.Context, client *openai.Client, mvClient mv
 
 			// Reset the slices for the next batch.
 			chunkIDs = chunkIDs[:0]
+			fileTypes = fileTypes[:0]
 			vectors = vectors[:0]
 		}
 
 		for emb := range embChan {
 			chunkIDs = append(chunkIDs, int64(emb.chunkID))
 			vectors = append(vectors, emb.data)
+			fileTypes = append(fileTypes, emb.fileType)
 
 			if len(chunkIDs) >= batchSize {
 				insertEmbeddings()
@@ -327,7 +362,13 @@ func calculateEmbeddings(ctx context.Context, client *openai.Client, mvClient mv
 		}
 	}()
 
-	rows, err := db.Query(`SELECT id, content FROM chunks WHERE processed IS FALSE;`)
+	// rows, err := db.Query(`SELECT id, content FROM chunks WHERE processed IS FALSE;`)
+	rows, err := db.Query(`
+		SELECT c.id, c.content, ft.file_type
+		FROM file_types ft
+		INNER JOIN chunks c ON ft.id = c.file_type_id
+		WHERE c.processed IS FALSE;
+	`)
 	if err != nil {
 		return fmt.Errorf("fail to query db: %w", err)
 	}
@@ -337,18 +378,21 @@ func calculateEmbeddings(ctx context.Context, client *openai.Client, mvClient mv
 	semaphore := make(chan struct{}, maxWorkers)
 	// Step 1: calculate embeddings for all chunks in the DB, storing them in embs.
 	for rows.Next() {
-		var (
-			id      int
-			content string
-		)
-		if err = rows.Scan(&id, &content); err != nil {
+		type chunk struct {
+			id       int
+			content  string
+			fileType string
+		}
+		var c chunk
+
+		if err = rows.Scan(&c.id, &c.content, &c.fileType); err != nil {
 			close(embChan)
 			return fmt.Errorf("fail to scan row: %w", err)
 		}
 
 		wg.Add(1)
 		semaphore <- struct{}{}
-		go func(id int, content string) {
+		go func(chunk chunk) {
 			defer wg.Done()
 			defer func() { <-semaphore }()
 			// Check for previous errors to avoid unnecessary work.
@@ -356,9 +400,9 @@ func calculateEmbeddings(ctx context.Context, client *openai.Client, mvClient mv
 			case <-errChan:
 				return
 			default:
-				fmt.Printf("id: %d, content size: %d\n", id, len(content))
-				if len(content) > 0 {
-					embeddings, err := getEmbeddings(client, content)
+				fmt.Printf("id: %d, content size: %d file type: %s\n", chunk.id, len(chunk.content), chunk.fileType)
+				if len(chunk.content) > 0 {
+					embeddings, err := getEmbeddings(client, chunk.content)
 					if err != nil {
 						errChan <- fmt.Errorf("fail to get embeddings: %w", err)
 						return
@@ -366,7 +410,7 @@ func calculateEmbeddings(ctx context.Context, client *openai.Client, mvClient mv
 
 					for _, emb := range embeddings {
 						select {
-						case embChan <- embData{chunkID: id, data: emb}:
+						case embChan <- embData{chunkID: chunk.id, data: emb, fileType: chunk.fileType}:
 						case err := <-errChan:
 							log.Println("Error received, stopping:", err)
 							return
@@ -374,7 +418,7 @@ func calculateEmbeddings(ctx context.Context, client *openai.Client, mvClient mv
 					}
 				}
 			}
-		}(id, content)
+		}(c)
 	}
 
 	if err = rows.Err(); err != nil {
@@ -400,7 +444,8 @@ func placeholders(n int) string {
 }
 
 // getEmbedding invokes the OpenAI embedding API to calculate the embedding
-// for the given string. It returns the embedding.
+// for the given string. if the string is too long, it splits it into chunks and
+// calculates the embedding for each chunk. It returns the embeddings.
 func getEmbeddings(client *openai.Client, data string) ([][]float32, error) {
 	var embeddings [][]float32
 	const maxTokensPerRequest = 8192
@@ -443,13 +488,13 @@ func splitIntoChunks(data string, maxChars int) []string {
 		}
 
 		if builder.Len() > 0 {
-			// Only add a space if the builder is not empty
+			// Only add a space if the builder is not empty.
 			builder.WriteRune(' ')
 		}
 		builder.WriteString(word)
 	}
 
-	// Add the last chunk if it's not empty
+	// Add the last chunk if it's not empty.
 	if builder.Len() > 0 {
 		chunks = append(chunks, builder.String())
 	}
@@ -457,10 +502,12 @@ func splitIntoChunks(data string, maxChars int) []string {
 	return chunks
 }
 
+// getEmbedding function invokes the OpenAI embedding API to calculate the embedding
+// for the given string. It returns the embedding.
 func getEmbedding(client *openai.Client, data string) ([]float32, error) {
 	queryReq := openai.EmbeddingRequest{
 		Input: []string{data},
-		Model: openai.SmallEmbedding3,
+		Model: openai.LargeEmbedding3,
 	}
 
 	queryResponse, err := client.CreateEmbeddings(context.Background(), queryReq)
@@ -468,25 +515,4 @@ func getEmbedding(client *openai.Client, data string) ([]float32, error) {
 		return nil, fmt.Errorf("fail to create embeddings: %w", err)
 	}
 	return queryResponse.Data[0].Embedding, nil
-}
-
-// encodeEmbedding encodes an embedding into a byte buffer, e.g. for DB storage as a blob.
-func encodeEmbedding(emb []float32) ([]byte, error) {
-	buf := make([]byte, len(emb)*4)
-	if err := binary.Write(bytes.NewBuffer(buf), binary.LittleEndian, emb); err != nil {
-		return nil, err
-	}
-	return buf, nil
-}
-
-// decodeEmbedding decodes an embedding back from a byte buffer.
-func decodeEmbedding(b []byte) ([]float32, error) {
-	// Calculate how many float32 values are in the slice.
-	count := len(b) / 4
-	numbers := make([]float32, count)
-	if err := binary.Read(bytes.NewBuffer(b), binary.LittleEndian, numbers); err != nil {
-		return nil, err
-	}
-
-	return numbers, nil
 }
