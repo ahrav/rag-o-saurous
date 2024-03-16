@@ -24,12 +24,10 @@ import (
 	"golang.org/x/net/html"
 )
 
-const tokenEncoding = "cl100k_base"
-const tableName = "chunks"
-const fileTypeTableName = "file_types"
-const chunkSize = 4096
+const (
+	tokenEncoding = "cl100k_base"
 
-const tableSql = `
+	tableSql = `
 CREATE TABLE IF NOT EXISTS %v (
   id INTEGER PRIMARY KEY,
   file_type TEXT UNIQUE
@@ -53,9 +51,13 @@ CREATE TABLE IF NOT EXISTS %v (
 CREATE INDEX IF NOT EXISTS idx_processed ON %v (processed);
 CREATE INDEX IF NOT EXISTS idx_file_type_id ON %v (file_type_id);
 `
+	tableName         = "chunks"
+	fileTypeTableName = "file_types"
+
+	chunkSize = 4096
+)
 
 func main() {
-
 	rootDir := flag.String("rootdir", ".", "root directory to take source code files from")
 	doClear := flag.Bool("clear", false, "clear DB table before inserting")
 	outDb := flag.String("outdb", "chunks.db", "filename for sqlite DB for output")
@@ -118,14 +120,18 @@ func main() {
 				var chunks []string
 				var fileTypeID int
 				if val == "go" {
-					chunks = chunkGoFile(tokenEncoder, path)
+					chunks, err = chunkGoFile(tokenEncoder, path)
 					fileTypeID = 1
 				} else if val == "html" {
-					chunks = chunkHtmlFile(tokenEncoder, path)
+					chunks, err = chunkHtmlFile(tokenEncoder, path)
 					fileTypeID = 2
 				} else {
-					chunks = chunkTextFile(tokenEncoder, path)
+					chunks, err = chunkTextFile(tokenEncoder, path)
 					fileTypeID = 3
+				}
+				if err != nil {
+					log.Printf("Error chunking %v: %v", path, err)
+					return
 				}
 
 				var batch []interface{}
@@ -176,7 +182,9 @@ func main() {
 		for _, batch := range batches {
 			for i := 0; i < len(batch); i += 4 {
 				_, err := insertStmt.Exec(batch[i], batch[i+1], batch[i+2], batch[i+3])
-				checkErr(err)
+				if err != nil {
+					log.Fatal(err)
+				}
 			}
 		}
 	}
@@ -193,17 +201,23 @@ func checkErr(err error) {
 // chunkGoFile reads the Go file in `path` and breaks it into chunks of
 // approximately chunkSize tokens each, returning the chunks.
 // It leverages the go parser to extract the code snippets.
-func chunkGoFile(encoder *tiktoken.Tiktoken, path string) []string {
+func chunkGoFile(encoder *tiktoken.Tiktoken, path string) ([]string, error) {
 	f, err := os.Open(path)
-	checkErr(err)
+	if err != nil {
+		return nil, err
+	}
 	defer f.Close()
 
 	src, err := io.ReadAll(f)
-	checkErr(err)
+	if err != nil {
+		return nil, err
+	}
 
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "", src, 0)
-	checkErr(err)
+	if err != nil {
+		return nil, err
+	}
 
 	var chunks []string
 	var currentChunk string
@@ -234,18 +248,17 @@ func chunkGoFile(encoder *tiktoken.Tiktoken, path string) []string {
 	// Append the remaining code snippet to the current chunk.
 	chunks = append(chunks, currentChunk)
 
-	return chunks
+	return chunks, nil
 }
 
-func chunkTextFile(encoder *tiktoken.Tiktoken, path string) []string {
+func chunkTextFile(encoder *tiktoken.Tiktoken, path string) ([]string, error) {
 	f, err := os.Open(path)
-	checkErr(err)
+	if err != nil {
+		return nil, err
+	}
 	defer f.Close()
 
-	src, err := io.ReadAll(f)
-	checkErr(err)
-
-	scanner := bufio.NewScanner(strings.NewReader(string(src)))
+	scanner := bufio.NewScanner(f)
 	scanner.Split(scanParagraphs)
 
 	var chunks []string
@@ -267,7 +280,7 @@ func chunkTextFile(encoder *tiktoken.Tiktoken, path string) []string {
 	// Append the remaining code snippet to the current chunk.
 	chunks = append(chunks, currentChunk)
 
-	return chunks
+	return chunks, nil
 }
 
 func scanParagraphs(data []byte, atEOF bool) (advance int, token []byte, err error) {
@@ -286,13 +299,17 @@ func scanParagraphs(data []byte, atEOF bool) (advance int, token []byte, err err
 	return 0, nil, nil
 }
 
-func chunkHtmlFile(encoder *tiktoken.Tiktoken, path string) []string {
+func chunkHtmlFile(encoder *tiktoken.Tiktoken, path string) ([]string, error) {
 	f, err := os.Open(path)
-	checkErr(err)
+	if err != nil {
+		return nil, err
+	}
 	defer f.Close()
 
 	doc, err := html.Parse(f)
-	checkErr(err)
+	if err != nil {
+		return nil, err
+	}
 
 	var chunks []string
 	var currentChunk string
@@ -336,5 +353,5 @@ func chunkHtmlFile(encoder *tiktoken.Tiktoken, path string) []string {
 		chunks = append(chunks, strings.TrimSpace(currentChunk))
 	}
 
-	return chunks
+	return chunks, nil
 }

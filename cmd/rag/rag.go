@@ -362,7 +362,6 @@ func calculateEmbeddings(ctx context.Context, client *openai.Client, mvClient mv
 		}
 	}()
 
-	// rows, err := db.Query(`SELECT id, content FROM chunks WHERE processed IS FALSE;`)
 	rows, err := db.Query(`
 		SELECT c.id, c.content, ft.file_type
 		FROM file_types ft
