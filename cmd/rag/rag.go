@@ -83,28 +83,47 @@ func answerQuestion(ctx context.Context, client *openai.Client, mvClient mvclien
 		return fmt.Errorf("fail to create search param: %w", err)
 	}
 
-	// Search for similar embeddings concurrently in the DB. We search using two queries:
+	// Search for similar embeddings concurrently in the DB. We search using three queries:
 	// 1. Search for similar embeddings for Go files with a higher topK value.
-	// 2. Search for similar embeddings for non-Go files with a lower topK value.
+	// 2. Search for similar embeddings for .md files with a lower topK value.
+	// 3. Search for similar embeddings for .html files with a lower topK value.
+	var resMu sync.Mutex
 	var results []mvclient.SearchResult
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		sr, err := mvClient.Search(ctx, collectionName, nil, `FileType == ".go"`, []string{"ChunkID"}, []entity.Vector{vector}, "Vector",
+			entity.COSINE, 3, sp)
+		if err != nil {
+			panic(err)
+		}
+		resMu.Lock()
+		results = append(results, sr...)
+		resMu.Unlock()
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sr, err := mvClient.Search(ctx, collectionName, nil, `FileType == ".md"`, []string{"ChunkID"}, []entity.Vector{vector}, "Vector",
 			entity.COSINE, 2, sp)
 		if err != nil {
 			panic(err)
 		}
+		resMu.Lock()
 		results = append(results, sr...)
+		resMu.Unlock()
 	}()
 
-	sr, err := mvClient.Search(ctx, collectionName, nil, `FileType != ".go"`, []string{"ChunkID"}, []entity.Vector{vector}, "Vector",
-		entity.COSINE, 1, sp)
+	sr, err := mvClient.Search(ctx, collectionName, nil, `FileType == ".html"`, []string{"ChunkID"}, []entity.Vector{vector}, "Vector",
+		entity.COSINE, 2, sp)
 	if err != nil {
 		panic(err)
 	}
+	resMu.Lock()
 	results = append(results, sr...)
+	resMu.Unlock()
 
 	wg.Wait()
 
@@ -129,6 +148,11 @@ func answerQuestion(ctx context.Context, client *openai.Client, mvClient mvclien
 			id, err := idColumn.ValueByIdx(i)
 			if err != nil {
 				return fmt.Errorf("fail to get value by idx: %w", err)
+			}
+
+			if result.Scores[i] < 0.4 {
+				fmt.Printf("score too low: %f\n", result.Scores[i])
+				continue
 			}
 
 			// Retrieve the chunk content by chunk id.
@@ -254,7 +278,7 @@ func calculateEmbeddings(ctx context.Context, client *openai.Client, mvClient mv
 	// Finally, create indexes for the embeddings table.
 	go func() {
 		defer func() {
-			ctx, cancel := context.WithTimeout(ctx, time.Second*30)
+			ctx, cancel := context.WithTimeout(ctx, time.Second*60)
 			defer cancel()
 			if err = mvClient.Flush(ctx, collectionName, false); err != nil {
 				log.Fatal("fail to flush:", err.Error())

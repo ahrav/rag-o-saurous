@@ -52,7 +52,7 @@ CREATE INDEX IF NOT EXISTS idx_file_type_id ON %v (file_type_id);
 	tableName         = "chunks"
 	fileTypeTableName = "file_types"
 
-	chunkSize = 4096
+	chunkSize = 512
 )
 
 func main() {
@@ -118,6 +118,9 @@ func main() {
 				var chunks []string
 				var fileTypeID int
 				if val == "go" {
+					if strings.HasSuffix(path, "_test.go") || strings.HasSuffix(path, ".pb.go") || strings.HasSuffix(path, ".pb.validate.go") {
+						return
+					}
 					chunks, err = chunkGoFile(tokenEncoder, path)
 					fileTypeID = 1
 				} else if val == "html" {
@@ -132,7 +135,7 @@ func main() {
 					return
 				}
 
-				var batch []interface{}
+				var batch []any
 				for i, chunk := range chunks {
 					fmt.Println(path, i, len(chunk))
 					tokTotal.Add(uint64(len(chunk)))
