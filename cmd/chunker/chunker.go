@@ -25,8 +25,6 @@ import (
 )
 
 const (
-	tokenEncoding = "cl100k_base"
-
 	tableSql = `
 CREATE TABLE IF NOT EXISTS %v (
   id INTEGER PRIMARY KEY,
@@ -92,7 +90,7 @@ func main() {
 	checkErr(err)
 
 	// Initialize the token encoder.
-	tokenEncoder, err := tiktoken.GetEncoding(tokenEncoding)
+	tokenEncoder, err := tiktoken.GetEncoding(tiktoken.MODEL_CL100K_BASE)
 	checkErr(err)
 
 	var wg sync.WaitGroup
